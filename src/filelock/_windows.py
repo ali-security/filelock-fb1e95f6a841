@@ -4,6 +4,7 @@ import os
 import sys
 from contextlib import suppress
 from errno import EACCES
+from functools import lru_cache
 from pathlib import Path
 from typing import cast
 
@@ -26,6 +27,27 @@ if sys.platform == "win32":  # pragma: win32 cover
     _ERROR_ACCESS_DENIED = 5
     _ERROR_SHARING_VIOLATION = 32
     _OWNER_WRITE = 0o200
+    _GROUP_AND_OTHERS = 0o077
+    # The DACL os.mkdir(mode=0o700) applies, minus the directory-only inheritance flags: protected (P), so the
+    # directory's inheritable entries stay out, with full access (FA) for SYSTEM, Administrators and the owner.
+    _OWNER_ONLY_SDDL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)"
+    _SDDL_REVISION_1 = 1
+
+    class _SECURITY_ATTRIBUTES(ctypes.Structure):  # noqa: N801  # mirrors the Win32 struct name
+        _fields_ = (
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL),
+        )
+
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
 
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.CreateFileW.argtypes = [
@@ -102,7 +124,10 @@ if sys.platform == "win32":  # pragma: win32 cover
 
         :param path: the lock file path.
         :param mode: the permission mode; as ``os.open`` does on Windows, a cleared owner-write bit creates the file
-            read-only. The attribute only takes effect when the file is created, not when an existing one is opened.
+            read-only. A mode without group and other bits creates it with an owner-only DACL (discretionary access
+            control list, the Windows permission list); any other mode has no Windows counterpart and leaves the file
+            the entries its directory hands down. Both only take effect when the file is created, not when an existing
+            one is opened.
 
         :returns: a file descriptor owning the opened handle, or ``None`` on a sharing violation or a delete-pending
             access denial the caller should treat as contention and retry.
@@ -120,11 +145,18 @@ if sys.platform == "win32":  # pragma: win32 cover
         flags_and_attributes = _FILE_FLAG_OPEN_REPARSE_POINT
         if not mode & _OWNER_WRITE:
             flags_and_attributes |= _FILE_ATTRIBUTE_READONLY
+        security_attributes: _SECURITY_ATTRIBUTES | None = None
+        if not mode & _GROUP_AND_OTHERS:
+            # Same OPEN_ALWAYS open, reparse check and descriptor as any other mode; only a file this open creates gets
+            # the owner-only DACL, an existing one keeps its own.
+            security_attributes = _SECURITY_ATTRIBUTES(
+                ctypes.sizeof(_SECURITY_ATTRIBUTES), _owner_only_descriptor(), False
+            )
         handle = _kernel32.CreateFileW(
             path,
             _GENERIC_READ | _GENERIC_WRITE,
             _FILE_SHARE_READ_WRITE,
-            None,
+            None if security_attributes is None else ctypes.addressof(security_attributes),
             _OPEN_ALWAYS,
             flags_and_attributes,
             None,
@@ -159,6 +191,16 @@ if sys.platform == "win32":  # pragma: win32 cover
         except BaseException:  # open_osfhandle audits too; a hook raising anything must not leak the handle
             _kernel32.CloseHandle(handle)
             raise
+
+    @lru_cache(maxsize=None)
+    def _owner_only_descriptor() -> int:
+        # Converted once and never freed: the open retries every poll interval while it waits for the lock.
+        descriptor = wintypes.LPVOID()
+        if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            _OWNER_ONLY_SDDL, _SDDL_REVISION_1, ctypes.byref(descriptor), None
+        ):  # pragma: no cover  # a constant string converts
+            raise ctypes.WinError(ctypes.get_last_error())
+        return cast(int, descriptor.value)
 
 else:  # pragma: win32 no cover
 
