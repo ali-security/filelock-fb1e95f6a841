@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import inspect
 import logging
 import os
@@ -112,8 +113,16 @@ WindowsOnly = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 @pytest.mark.parametrize(
     ("expected_error", "match", "bad_lock_file"),
     [
-        pytest.param(FileNotFoundError, "No such file or directory:", "a/b", id="non_existent_directory"),
-        pytest.param(FileNotFoundError, "No such file or directory:", "", id="blank_filename"),
+        # WindowsFileLock raises the real Win32 error now, so accept its wording alongside os.open's.
+        pytest.param(
+            FileNotFoundError,
+            "No such file or directory:|cannot find the (path|file)",
+            "a/b",
+            id="non_existent_directory",
+        ),
+        pytest.param(
+            FileNotFoundError, "No such file or directory:|cannot find the (path|file)", "", id="blank_filename"
+        ),
         pytest.param(ValueError, "embedded null (byte|character)", "\0", id="null_byte"),
         # Should be PermissionError on Windows
         pytest.param(PermissionError, "Permission denied:", ".", id="current_directory")
@@ -127,7 +136,10 @@ WindowsOnly = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
             pytest.param(OSError, None, ".", id="current_directory")
         ),
     ]
-    + [pytest.param(OSError, "Invalid argument", i, id=f"invalid_{i}", marks=WindowsOnly) for i in '<>:"|?*\a']
+    + [
+        pytest.param(OSError, "Invalid argument|syntax is incorrect", i, id=f"invalid_{i}", marks=WindowsOnly)
+        for i in '<>:"|?*\a'
+    ]
     + [pytest.param(PermissionError, "Permission denied:", i, id=f"permission_{i}", marks=WindowsOnly) for i in "/\\"],
 )
 @pytest.mark.timeout(5)  # timeout in case of infinite loop
@@ -625,3 +637,70 @@ def test_lock_can_be_non_thread_local(
     assert lock.lock_counter == 2
 
     lock.release(force=True)
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except NotImplementedError:  # PyPy before 3.9 has no os.symlink on Windows, so call the Win32 API directly
+        if sys.platform == "win32":  # only the Windows-only tests get here; the guard narrows ctypes.WinDLL for mypy
+            import ctypes
+
+            create_symbolic_link = ctypes.WinDLL("kernel32", use_last_error=True).CreateSymbolicLinkW
+            create_symbolic_link.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            create_symbolic_link.restype = ctypes.c_ubyte
+            # 0x2 is SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, honoured when Developer Mode is on
+            if create_symbolic_link(str(link), str(target), 0x2):
+                return
+        pytest.skip("cannot create symlinks (needs Developer Mode or administrator)")
+    except OSError:
+        pytest.skip("cannot create symlinks (needs Developer Mode or administrator)")
+
+
+@WindowsOnly
+def test_windows_reparse_point_lock_file_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("sensitive", encoding="utf-8")
+    link = tmp_path / "resource.lock"
+    _symlink_or_skip(link, target)
+
+    with pytest.raises(OSError, match="reparse point"):
+        FileLock(link).acquire()
+
+    assert target.read_text(encoding="utf-8") == "sensitive"
+
+
+@WindowsOnly
+def test_windows_dangling_reparse_point_lock_file_rejected(tmp_path: Path) -> None:
+    # a dangling symlink planted at the lock path must not make the lock create the file it points to
+    target = tmp_path / "target.txt"
+    link = tmp_path / "resource.lock"
+    _symlink_or_skip(link, target)
+
+    with pytest.raises(OSError, match="reparse point"):
+        FileLock(link, timeout=0).acquire()
+
+    assert not target.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32" or not hasattr(os, "O_NOFOLLOW"), reason="needs POSIX O_NOFOLLOW")
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling_target"])
+def test_unix_symlink_lock_file_not_followed(tmp_path: Path, target_exists: bool) -> None:  # noqa: FBT001
+    # a symlink planted at the lock path must not make the lock truncate or create the file it points to
+    target = tmp_path / "target.txt"
+    if target_exists:
+        target.write_text("sensitive", encoding="utf-8")
+    link = tmp_path / "resource.lock"
+    link.symlink_to(target)
+
+    lock = UnixFileLock(link, timeout=0)
+    with pytest.raises(OSError) as exc_info:  # noqa: PT011
+        lock.acquire()
+
+    assert not isinstance(exc_info.value, Timeout)
+    assert exc_info.value.errno in (errno.ELOOP, errno.EMLINK)  # EMLINK is what FreeBSD reports for O_NOFOLLOW
+    assert not lock.is_locked
+    if target_exists:
+        assert target.read_text(encoding="utf-8") == "sensitive"
+    else:
+        assert not target.exists()
