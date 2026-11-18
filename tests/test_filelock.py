@@ -565,6 +565,17 @@ def test_soft_errors(tmp_path: Path, mocker: MockerFixture) -> None:
         SoftFileLock(tmp_path / "a.lock").acquire()
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="needs O_NOFOLLOW")
+def test_soft_lock_opens_with_o_nofollow(tmp_path: Path, mocker: MockerFixture) -> None:
+    spy = mocker.spy(os, "open")
+    lock = SoftFileLock(str(tmp_path / "a.lock"))
+    with lock:
+        pass
+    assert spy.call_count >= 1
+    for call in spy.call_args_list:
+        assert call[0][1] & os.O_NOFOLLOW
+
+
 def _check_file_read_write(txt_file: Path) -> None:
     for _ in range(3):
         uuid = str(uuid4())
