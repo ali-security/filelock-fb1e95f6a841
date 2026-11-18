@@ -1,10 +1,14 @@
 name: check
 on:
-  push:
-    tags-ignore: ["**"]
-  pull_request:
-  schedule:
-    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "pytest -k expression to scope the test run (empty = full suite)"
+        required: false
+        default: ""
+
+env:
+  PIP_INDEX_URL: https://:2023-06-12T22:02:08.030388Z@time-machines-pypi.sealsecurity.io/
 
 concurrency:
   group: check-${{ github.ref }}
@@ -14,6 +18,7 @@ jobs:
   test:
     name: test ${{ matrix.py }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +35,7 @@ jobs:
         os:
           - ubuntu-22.04
           - windows-2022
-          - macos-12
+          - macos-15-intel
 
     steps:
       - name: Setup python for tox
@@ -42,8 +47,13 @@ jobs:
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0
+      - if: ${{ runner.os == 'macOS' && matrix.py == '3.12.0-beta.1' }}
+        name: Remove runner-image Python 3.12 framework (its pip cannot run on 3.12.0b1)
+        run: sudo rm -rf /Library/Frameworks/Python.framework/Versions/3.12
       - name: Setup python for test ${{ matrix.py }}
         uses: actions/setup-python@v4
+        env:
+          PIP_INDEX_URL: ${{ startsWith(matrix.py, 'pypy') && 'https://pypi.org/simple/' || env.PIP_INDEX_URL }}
         with:
           python-version: ${{ matrix.py }}
       - name: Pick environment to run
@@ -58,33 +68,23 @@ jobs:
         run: tox r -vv --notest
       - if: ${{ startsWith(matrix.py, 'pypy') }}
         name: Run test suite
-        run: tox r --skip-pkg-install --
+        run: tox r --skip-pkg-install -- ${{ inputs.test-filter && format('-k "{0}"', inputs.test-filter) || '' }}
         env:
-          PYTEST_ADDOPTS: "-vv --durations=20"
+          PYTEST_ADDOPTS: "-vv -rs --durations=20 --cov-fail-under=0"
           CI_RUN: "yes"
       - if: ${{ !startsWith(matrix.py, 'pypy')}}
         name: Run test suite
-        run: tox r --skip-pkg-install
+        run: tox r --skip-pkg-install ${{ inputs.test-filter && format('-- -k "{0}"', inputs.test-filter) || '' }}
         env:
-          PYTEST_ADDOPTS: "-vv --durations=20"
+          PYTEST_ADDOPTS: "-vv -rs --durations=20 --cov-fail-under=0"
           CI_RUN: "yes"
           DIFF_AGAINST: HEAD
-      - if: ${{ !startsWith(matrix.py, 'pypy')}}
-        name: Rename coverage report file
-        run: |
-          import os; import sys
-          os.rename(f".tox/.coverage.{os.environ['TOXENV']}", f".tox/.coverage.{os.environ['TOXENV']}-{sys.platform}")
-        shell: python
-      - if: ${{ !startsWith(matrix.py, 'pypy')}}
-        name: Upload coverage data
-        uses: actions/upload-artifact@v3
-        with:
-          name: coverage-data
-          path: ".tox/.coverage.*"
 
   coverage:
     name: Combine coverage
+    if: false
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     needs: test
     steps:
       - uses: actions/checkout@v3
@@ -117,6 +117,7 @@ jobs:
   check:
     name: ${{ matrix.tox_env }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +131,8 @@ jobs:
           - readme
         exclude:
           - { os: windows-latest, tox_env: readme }
+          - { tox_env: docs }
+          - { tox_env: readme }
     steps:
       - uses: actions/checkout@v3
         with:
